@@ -1,0 +1,5 @@
+config_xtream.json
+__pycache__/
+*.py[cod]
+venv/
+.venv/

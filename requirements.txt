@@ -1,0 +1,4 @@
+PyQt6
+python-vlc
+requests
+m3u8
