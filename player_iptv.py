@@ -10,10 +10,12 @@ from PyQt6.QtWidgets import (
     QStatusBar, QMessageBox, QComboBox, QSplitter, QSlider, QDialog,
     QFormLayout, QLabel, QTabWidget
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
 from PyQt6.QtGui import QKeyEvent
 
 CONFIG_FILE = "config_xtream.json"
+ORG_NAME = "reimen83"
+APP_NAME = "linux-iptv-player-pro"
 
 # Palavras-chave usadas para filtrar e isolar conteúdo adulto automaticamente
 ADULT_KEYWORDS = ["adulto", "adults", "18+", "+18", "xxx", "erotico", "erotica", "for adult", "porn", "redlight"]
@@ -26,28 +28,52 @@ def is_adult_category(category_name):
 
 
 def save_xtream_config(url, username, password):
-    """Salva as credenciais do Xtream Codes em um arquivo JSON local."""
-    data = {
-        "server_url": url,
-        "username": username,
-        "password": password
-    }
+    """Salva as credenciais do Xtream Codes usando QSettings (não salva em texto plano no projeto).
+
+    Ainda faz migração de um arquivo config_xtream.json antigo caso exista.
+    """
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
+        settings = QSettings(ORG_NAME, APP_NAME)
+        settings.setValue("server_url", url)
+        settings.setValue("username", username)
+        settings.setValue("password", password)
+        settings.sync()
+
+        # Se havia um arquivo de configuração legada, remova-o para evitar confusão
+        try:
+            if os.path.exists(CONFIG_FILE):
+                os.remove(CONFIG_FILE)
+        except Exception:
+            pass
     except Exception as e:
-        print(f"Erro ao salvar configurações: {e}")
+        print(f"Erro ao salvar configurações com QSettings: {e}")
 
 
 def load_xtream_config():
-    """Carrega as credenciais salvas do arquivo JSON local."""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Erro ao ler configurações: {e}")
-    return {"server_url": "", "username": "", "password": ""}
+    """Carrega as credenciais salvas. Primeiro tenta QSettings; se não existir, tenta migrar de config_xtream.json."""
+    try:
+        settings = QSettings(ORG_NAME, APP_NAME)
+        server_url = settings.value("server_url", "") or ""
+        username = settings.value("username", "") or ""
+        password = settings.value("password", "") or ""
+
+        # Se QSettings não tiver nada, tentar migrar do arquivo JSON antigo
+        if not (server_url or username or password) and os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    server_url = data.get("server_url", "")
+                    username = data.get("username", "")
+                    password = data.get("password", "")
+                # migrar para QSettings e tentar remover o arquivo
+                save_xtream_config(server_url, username, password)
+            except Exception as e:
+                print(f"Erro ao migrar configurações antigas: {e}")
+
+        return {"server_url": server_url, "username": username, "password": password}
+    except Exception as e:
+        print(f"Erro ao ler configurações: {e}")
+        return {"server_url": "", "username": "", "password": ""}
 
 
 def format_time(ms):
@@ -120,51 +146,68 @@ class XtreamLoaderWorker(QThread):
                 "adult": []
             }
 
+            session = requests.Session()
+
             # 1. Busca Canais Ao Vivo
-            resp_live = requests.get(api_url, params={"username": self.username, "password": self.password, "action": "get_live_streams"}, headers=headers, timeout=15)
-            if resp_live.status_code == 200 and isinstance(resp_live.json(), list):
-                for item in resp_live.json():
-                    stream_id = item.get("stream_id")
-                    name = item.get("name", "Canal sem nome")
-                    group = str(item.get("category_id", "Ao Vivo"))
-                    stream_url = f"{self.server_url}/live/{self.username}/{self.password}/{stream_id}.m3u8"
-                    
-                    data = {"name": name, "url": stream_url, "group": group, "type": "live"}
-                    if is_adult_category(group) or is_adult_category(name):
-                        result["adult"].append(data)
-                    else:
-                        result["live"].append(data)
+            resp_live = session.get(api_url, params={"username": self.username, "password": self.password, "action": "get_live_streams"}, headers=headers, timeout=15)
+            if resp_live.status_code == 200:
+                try:
+                    json_live = resp_live.json()
+                except Exception:
+                    json_live = []
+                if isinstance(json_live, list):
+                    for item in json_live:
+                        stream_id = item.get("stream_id")
+                        name = item.get("name", "Canal sem nome")
+                        group = str(item.get("category_id", "Ao Vivo"))
+                        stream_url = f"{self.server_url}/live/{self.username}/{self.password}/{stream_id}.m3u8"
+
+                        data = {"name": name, "url": stream_url, "group": group, "type": "live"}
+                        if is_adult_category(group) or is_adult_category(name):
+                            result["adult"].append(data)
+                        else:
+                            result["live"].append(data)
 
             # 2. Busca VOD (Filmes e Cursos)
-            resp_vod = requests.get(api_url, params={"username": self.username, "password": self.password, "action": "get_vod_streams"}, headers=headers, timeout=15)
-            if resp_vod.status_code == 200 and isinstance(resp_vod.json(), list):
-                for item in resp_vod.json():
-                    stream_id = item.get("stream_id")
-                    name = item.get("name", "Filme/Vídeo sem nome")
-                    group = str(item.get("category_id", "Filmes & VOD"))
-                    ext = item.get("container_extension", "mp4")
-                    stream_url = f"{self.server_url}/movie/{self.username}/{self.password}/{stream_id}.{ext}"
+            resp_vod = session.get(api_url, params={"username": self.username, "password": self.password, "action": "get_vod_streams"}, headers=headers, timeout=15)
+            if resp_vod.status_code == 200:
+                try:
+                    json_vod = resp_vod.json()
+                except Exception:
+                    json_vod = []
+                if isinstance(json_vod, list):
+                    for item in json_vod:
+                        stream_id = item.get("stream_id")
+                        name = item.get("name", "Filme/Vídeo sem nome")
+                        group = str(item.get("category_id", "Filmes & VOD"))
+                        ext = item.get("container_extension", "mp4")
+                        stream_url = f"{self.server_url}/movie/{self.username}/{self.password}/{stream_id}.{ext}"
 
-                    data = {"name": name, "url": stream_url, "group": group, "type": "vod"}
-                    if is_adult_category(group) or is_adult_category(name):
-                        result["adult"].append(data)
-                    else:
-                        result["vod"].append(data)
+                        data = {"name": name, "url": stream_url, "group": group, "type": "vod"}
+                        if is_adult_category(group) or is_adult_category(name):
+                            result["adult"].append(data)
+                        else:
+                            result["vod"].append(data)
 
             # 3. Busca Séries
-            resp_series = requests.get(api_url, params={"username": self.username, "password": self.password, "action": "get_series"}, headers=headers, timeout=15)
-            if resp_series.status_code == 200 and isinstance(resp_series.json(), list):
-                for item in resp_series.json():
-                    series_id = item.get("series_id")
-                    name = item.get("name", "Série sem nome")
-                    group = str(item.get("category_id", "Séries"))
-                    stream_url = f"{self.server_url}/series/{self.username}/{self.password}/{series_id}.mp4"
+            resp_series = session.get(api_url, params={"username": self.username, "password": self.password, "action": "get_series"}, headers=headers, timeout=15)
+            if resp_series.status_code == 200:
+                try:
+                    json_series = resp_series.json()
+                except Exception:
+                    json_series = []
+                if isinstance(json_series, list):
+                    for item in json_series:
+                        series_id = item.get("series_id")
+                        name = item.get("name", "Série sem nome")
+                        group = str(item.get("category_id", "Séries"))
+                        stream_url = f"{self.server_url}/series/{self.username}/{self.password}/{series_id}.mp4"
 
-                    data = {"name": name, "url": stream_url, "group": group, "type": "series"}
-                    if is_adult_category(group) or is_adult_category(name):
-                        result["adult"].append(data)
-                    else:
-                        result["series"].append(data)
+                        data = {"name": name, "url": stream_url, "group": group, "type": "series"}
+                        if is_adult_category(group) or is_adult_category(name):
+                            result["adult"].append(data)
+                        else:
+                            result["series"].append(data)
 
             self.finished.emit(result, "")
 
@@ -407,12 +450,14 @@ class IPTVPlayer(QMainWindow):
             self.status_bar.showMessage("Falha no login Xtream Codes.")
         else:
             if self.last_credentials:
+                # Salva de forma segura via QSettings
                 save_xtream_config(*self.last_credentials)
 
-            self.channels_live.extend(result.get("live", []))
-            self.channels_vod.extend(result.get("vod", []))
-            self.channels_series.extend(result.get("series", []))
-            self.channels_adult.extend(result.get("adult", []))
+            # Substitui listas por novos dados (evita duplicação ao reconectar)
+            self.channels_live = result.get("live", []) or []
+            self.channels_vod = result.get("vod", []) or []
+            self.channels_series = result.get("series", []) or []
+            self.channels_adult = result.get("adult", []) or []
 
             self.update_categories()
             self.filter_channels()
@@ -487,7 +532,7 @@ class IPTVPlayer(QMainWindow):
         self.filtered_channels.sort(key=lambda x: x['name'].lower())
 
         for ch in self.filtered_channels:
-            group_tag = f" [{ch['group']}]" if ch.get('group') else ""
+            group_tag = f" [{ch['group']}]") if ch.get('group') else ""
             item = QListWidgetItem(f"{ch['name']}{group_tag}")
             self.channel_list.addItem(item)
 
@@ -500,7 +545,14 @@ class IPTVPlayer(QMainWindow):
 
             win_id = int(self.video_frame.winId())
             if sys.platform.startswith("linux"):
-                self.media_player.set_xwindow(win_id)
+                try:
+                    self.media_player.set_xwindow(win_id)
+                except Exception:
+                    # fallback: some environments use set_nsobject or set_hwnd
+                    try:
+                        self.media_player.set_nsobject(win_id)
+                    except Exception:
+                        pass
 
             media = self.vlc_instance.media_new(ch['url'])
             self.media_player.set_media(media)
