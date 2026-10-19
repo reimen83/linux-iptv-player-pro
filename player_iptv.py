@@ -1,8 +1,6 @@
 import sys
 import os
-import json
-import requests
-import m3u8
+
 import vlc
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -10,70 +8,12 @@ from PyQt6.QtWidgets import (
     QStatusBar, QMessageBox, QComboBox, QSplitter, QSlider, QDialog,
     QFormLayout, QLabel, QTabWidget
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QKeyEvent
 
-CONFIG_FILE = "config_xtream.json"
-ORG_NAME = "reimen83"
-APP_NAME = "linux-iptv-player-pro"
-
-# Palavras-chave usadas para filtrar e isolar conteúdo adulto automaticamente
-ADULT_KEYWORDS = ["adulto", "adults", "18+", "+18", "xxx", "erotico", "erotica", "for adult", "porn", "redlight"]
-
-
-def is_adult_category(category_name):
-    """Verifica se a categoria se enquadra em conteúdo adulto."""
-    cat_lower = str(category_name).lower()
-    return any(keyword in cat_lower for keyword in ADULT_KEYWORDS)
-
-
-def save_xtream_config(url, username, password):
-    """Salva as credenciais do Xtream Codes usando QSettings (não salva em texto plano no projeto).
-
-    Ainda faz migração de um arquivo config_xtream.json antigo caso exista.
-    """
-    try:
-        settings = QSettings(ORG_NAME, APP_NAME)
-        settings.setValue("server_url", url)
-        settings.setValue("username", username)
-        settings.setValue("password", password)
-        settings.sync()
-
-        # Se havia um arquivo de configuração legada, remova-o para evitar confusão
-        try:
-            if os.path.exists(CONFIG_FILE):
-                os.remove(CONFIG_FILE)
-        except Exception:
-            pass
-    except Exception as e:
-        print(f"Erro ao salvar configurações com QSettings: {e}")
-
-
-def load_xtream_config():
-    """Carrega as credenciais salvas. Primeiro tenta QSettings; se não existir, tenta migrar de config_xtream.json."""
-    try:
-        settings = QSettings(ORG_NAME, APP_NAME)
-        server_url = settings.value("server_url", "") or ""
-        username = settings.value("username", "") or ""
-        password = settings.value("password", "") or ""
-
-        # Se QSettings não tiver nada, tentar migrar do arquivo JSON antigo
-        if not (server_url or username or password) and os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    server_url = data.get("server_url", "")
-                    username = data.get("username", "")
-                    password = data.get("password", "")
-                # migrar para QSettings e tentar remover o arquivo
-                save_xtream_config(server_url, username, password)
-            except Exception as e:
-                print(f"Erro ao migrar configurações antigas: {e}")
-
-        return {"server_url": server_url, "username": username, "password": password}
-    except Exception as e:
-        print(f"Erro ao ler configurações: {e}")
-        return {"server_url": "", "username": "", "password": ""}
+from config_manager import load_xtream_config, save_xtream_config
+from m3u_parser import parse_m3u_robust
+from xtream_client import XtreamLoaderWorker
 
 
 def format_time(ms):
@@ -125,155 +65,6 @@ class XtreamLoginDialog(QDialog):
         return url, user, password
 
 
-class XtreamLoaderWorker(QThread):
-    finished = pyqtSignal(dict, str)
-
-    def __init__(self, server_url, username, password):
-        super().__init__()
-        self.server_url = server_url
-        self.username = username
-        self.password = password
-
-    def run(self):
-        try:
-            api_url = f"{self.server_url}/player_api.php"
-            headers = {"User-Agent": "Mozilla/5.0"}
-
-            result = {
-                "live": [],
-                "vod": [],
-                "series": [],
-                "adult": []
-            }
-
-            session = requests.Session()
-
-            # 1. Busca Canais Ao Vivo
-            resp_live = session.get(api_url, params={"username": self.username, "password": self.password, "action": "get_live_streams"}, headers=headers, timeout=15)
-            if resp_live.status_code == 200:
-                try:
-                    json_live = resp_live.json()
-                except Exception:
-                    json_live = []
-                if isinstance(json_live, list):
-                    for item in json_live:
-                        stream_id = item.get("stream_id")
-                        name = item.get("name", "Canal sem nome")
-                        group = str(item.get("category_id", "Ao Vivo"))
-                        stream_url = f"{self.server_url}/live/{self.username}/{self.password}/{stream_id}.m3u8"
-
-                        data = {"name": name, "url": stream_url, "group": group, "type": "live"}
-                        if is_adult_category(group) or is_adult_category(name):
-                            result["adult"].append(data)
-                        else:
-                            result["live"].append(data)
-
-            # 2. Busca VOD (Filmes e Cursos)
-            resp_vod = session.get(api_url, params={"username": self.username, "password": self.password, "action": "get_vod_streams"}, headers=headers, timeout=15)
-            if resp_vod.status_code == 200:
-                try:
-                    json_vod = resp_vod.json()
-                except Exception:
-                    json_vod = []
-                if isinstance(json_vod, list):
-                    for item in json_vod:
-                        stream_id = item.get("stream_id")
-                        name = item.get("name", "Filme/Vídeo sem nome")
-                        group = str(item.get("category_id", "Filmes & VOD"))
-                        ext = item.get("container_extension", "mp4")
-                        stream_url = f"{self.server_url}/movie/{self.username}/{self.password}/{stream_id}.{ext}"
-
-                        data = {"name": name, "url": stream_url, "group": group, "type": "vod"}
-                        if is_adult_category(group) or is_adult_category(name):
-                            result["adult"].append(data)
-                        else:
-                            result["vod"].append(data)
-
-            # 3. Busca Séries
-            resp_series = session.get(api_url, params={"username": self.username, "password": self.password, "action": "get_series"}, headers=headers, timeout=15)
-            if resp_series.status_code == 200:
-                try:
-                    json_series = resp_series.json()
-                except Exception:
-                    json_series = []
-                if isinstance(json_series, list):
-                    for item in json_series:
-                        series_id = item.get("series_id")
-                        name = item.get("name", "Série sem nome")
-                        group = str(item.get("category_id", "Séries"))
-                        stream_url = f"{self.server_url}/series/{self.username}/{self.password}/{series_id}.mp4"
-
-                        data = {"name": name, "url": stream_url, "group": group, "type": "series"}
-                        if is_adult_category(group) or is_adult_category(name):
-                            result["adult"].append(data)
-                        else:
-                            result["series"].append(data)
-
-            self.finished.emit(result, "")
-
-        except Exception as e:
-            self.finished.emit({}, f"Falha na conexão: {str(e)}")
-
-
-def parse_m3u_robust(content, base_uri=""):
-    channels_live = []
-    channels_adult = []
-
-    try:
-        parsed = m3u8.loads(content, uri=base_uri)
-        if parsed.segments:
-            for segment in parsed.segments:
-                url = segment.absolute_uri if segment.absolute_uri else segment.uri
-                title = segment.title if segment.title else "Canal sem nome"
-                group = "Geral"
-                if hasattr(segment, 'custom_parser_values') and segment.custom_parser_values:
-                    group = segment.custom_parser_values.get('group-title', 'Geral')
-
-                data = {"name": title, "url": url, "group": group, "type": "live"}
-                if is_adult_category(group) or is_adult_category(title):
-                    channels_adult.append(data)
-                else:
-                    channels_live.append(data)
-
-            if channels_live or channels_adult:
-                return channels_live, channels_adult
-    except Exception:
-        pass
-
-    lines = content.splitlines()
-    current_name = "Canal sem nome"
-    current_group = "Geral"
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("#EXTINF"):
-            if "," in line:
-                current_name = line.split(",")[-1].strip() or "Canal sem nome"
-            if 'group-title="' in line:
-                try:
-                    current_group = line.split('group-title="')[1].split('"')[0]
-                except IndexError:
-                    current_group = "Geral"
-        elif not line.startswith("#") and ("://" in line or line.endswith((".m3u8", ".ts", ".mp4", ".mkv"))):
-            data = {
-                "name": current_name,
-                "url": line,
-                "group": current_group,
-                "type": "live"
-            }
-            if is_adult_category(current_group) or is_adult_category(current_name):
-                channels_adult.append(data)
-            else:
-                channels_live.append(data)
-
-            current_name = "Canal sem nome"
-            current_group = "Geral"
-
-    return channels_live, channels_adult
-
-
 class IPTVPlayer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -294,7 +85,6 @@ class IPTVPlayer(QMainWindow):
         self.last_credentials = None
         self.is_slider_user_dragging = False
 
-        # Timer para progresso do vídeo e detecção de legendas
         self.timer = QTimer(self)
         self.timer.setInterval(500)
         self.timer.timeout.connect(self.update_video_progress)
@@ -310,9 +100,7 @@ class IPTVPlayer(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # Barra Superior
         top_bar = QHBoxLayout()
-
         self.btn_open_file = QPushButton("📁 Abrir Arquivo .m3u")
         self.btn_open_file.clicked.connect(self.open_file)
         top_bar.addWidget(self.btn_open_file)
@@ -320,13 +108,10 @@ class IPTVPlayer(QMainWindow):
         self.btn_xtream_login = QPushButton("🔐 Login Xtream Codes")
         self.btn_xtream_login.clicked.connect(self.open_xtream_dialog)
         top_bar.addWidget(self.btn_xtream_login)
-
         main_layout.addLayout(top_bar)
 
-        # Splitter de Janelas
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Painel Esquerdo (Abas + Categorias + Lista)
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -355,7 +140,6 @@ class IPTVPlayer(QMainWindow):
 
         splitter.addWidget(left_panel)
 
-        # Painel Direito (Player + Controles)
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -364,7 +148,6 @@ class IPTVPlayer(QMainWindow):
         self.video_frame.setStyleSheet("background-color: black;")
         right_layout.addWidget(self.video_frame, stretch=1)
 
-        # Container do Slider de Tempo (On-Demand)
         self.progress_container = QWidget()
         progress_layout = QHBoxLayout(self.progress_container)
         progress_layout.setContentsMargins(5, 2, 5, 2)
@@ -381,7 +164,6 @@ class IPTVPlayer(QMainWindow):
         self.progress_container.hide()
         right_layout.addWidget(self.progress_container)
 
-        # Barra de Controles de Mídia + Seleção de Legenda
         controls_bar = QHBoxLayout()
 
         self.btn_prev = QPushButton("⏮ Anterior")
@@ -396,7 +178,6 @@ class IPTVPlayer(QMainWindow):
         self.btn_next.clicked.connect(self.play_next)
         controls_bar.addWidget(self.btn_next)
 
-        # Seleção de Legendas
         self.subtitle_combo = QComboBox()
         self.subtitle_combo.addItem("💬 Legenda: Desativada", -1)
         self.subtitle_combo.currentIndexChanged.connect(self.change_subtitle)
@@ -424,7 +205,6 @@ class IPTVPlayer(QMainWindow):
         self.status_bar.showMessage("Pronto.")
 
     def keyPressEvent(self, event: QKeyEvent):
-        """Sai da tela cheia ao pressionar qualquer tecla (incluindo ESC)."""
         if self.isFullScreen():
             self.showNormal()
         else:
@@ -448,21 +228,21 @@ class IPTVPlayer(QMainWindow):
         if error:
             QMessageBox.critical(self, "Erro Xtream Codes", error)
             self.status_bar.showMessage("Falha no login Xtream Codes.")
-        else:
-            if self.last_credentials:
-                # Salva de forma segura via QSettings
-                save_xtream_config(*self.last_credentials)
+            return
 
-            # Substitui listas por novos dados (evita duplicação ao reconectar)
-            self.channels_live = result.get("live", []) or []
-            self.channels_vod = result.get("vod", []) or []
-            self.channels_series = result.get("series", []) or []
-            self.channels_adult = result.get("adult", []) or []
+        if self.last_credentials:
+            save_xtream_config(*self.last_credentials)
 
-            self.update_categories()
-            self.filter_channels()
+        self.channels_live = result.get("live", []) or []
+        self.channels_vod = result.get("vod", []) or []
+        self.channels_series = result.get("series", []) or []
+        self.channels_adult = result.get("adult", []) or []
 
-            self.status_bar.showMessage(f"Sucesso: {len(self.channels_live)} Ao Vivo, {len(self.channels_vod)} VOD, {len(self.channels_series)} Séries, {len(self.channels_adult)} Adulto.")
+        self.update_categories()
+        self.filter_channels()
+        self.status_bar.showMessage(
+            f"Sucesso: {len(self.channels_live)} Ao Vivo, {len(self.channels_vod)} VOD, {len(self.channels_series)} Séries, {len(self.channels_adult)} Adulto."
+        )
 
     def open_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Selecionar M3U", "", "Playlists (*.m3u *.m3u8 *.txt)")
@@ -480,6 +260,8 @@ class IPTVPlayer(QMainWindow):
                 live, adult = parse_m3u_robust(content)
                 self.channels_live = live
                 self.channels_adult = adult
+                self.channels_vod = []
+                self.channels_series = []
 
                 self.update_categories()
                 self.filter_channels()
@@ -495,8 +277,7 @@ class IPTVPlayer(QMainWindow):
             return self.channels_vod
         elif idx == 2:
             return self.channels_series
-        else:
-            return self.channels_adult
+        return self.channels_adult
 
     def on_tab_changed(self, index):
         self.update_categories()
@@ -525,14 +306,13 @@ class IPTVPlayer(QMainWindow):
         for ch in source_list:
             matches_group = (selected_category == "Todas as Categorias") or (ch.get('group') == selected_category)
             matches_search = search in ch['name'].lower()
-
             if matches_group and matches_search:
                 self.filtered_channels.append(ch)
 
         self.filtered_channels.sort(key=lambda x: x['name'].lower())
 
         for ch in self.filtered_channels:
-            group_tag = f" [{ch['group']}]") if ch.get('group') else ""
+            group_tag = f" [{ch['group']}]" if ch.get('group') else ""
             item = QListWidgetItem(f"{ch['name']}{group_tag}")
             self.channel_list.addItem(item)
 
@@ -540,7 +320,6 @@ class IPTVPlayer(QMainWindow):
         if 0 <= index < len(self.filtered_channels):
             self.current_index = index
             ch = self.filtered_channels[index]
-
             self.channel_list.setCurrentRow(index)
 
             win_id = int(self.video_frame.winId())
@@ -548,7 +327,6 @@ class IPTVPlayer(QMainWindow):
                 try:
                     self.media_player.set_xwindow(win_id)
                 except Exception:
-                    # fallback: some environments use set_nsobject or set_hwnd
                     try:
                         self.media_player.set_nsobject(win_id)
                     except Exception:
@@ -558,7 +336,6 @@ class IPTVPlayer(QMainWindow):
             self.media_player.set_media(media)
             self.media_player.play()
 
-            # Configura exibição de barra de progresso para On-Demand
             content_type = ch.get("type", "live")
             if content_type in ["vod", "series"]:
                 self.progress_container.show()
@@ -567,7 +344,6 @@ class IPTVPlayer(QMainWindow):
                 self.progress_container.hide()
                 self.timer.stop()
 
-            # Dispara a busca de faixas de legenda
             self.subtitle_combo.blockSignals(True)
             self.subtitle_combo.clear()
             self.subtitle_combo.addItem("💬 Legenda: Desativada", -1)
@@ -577,23 +353,19 @@ class IPTVPlayer(QMainWindow):
             self.status_bar.showMessage(f"Reproduzindo: {ch['name']}")
 
     def load_available_subtitles(self):
-        """Lê as faixas de legendas enviadas pela transmissão e preenche o ComboBox."""
         subtitles = self.media_player.video_get_spu_description()
         if subtitles:
             self.subtitle_combo.blockSignals(True)
             self.subtitle_combo.clear()
             self.subtitle_combo.addItem("💬 Legenda: Desativada", -1)
-
             for sub_id, name in subtitles:
                 if sub_id != -1:
                     track_name = name.decode('utf-8', errors='ignore') if isinstance(name, bytes) else str(name)
                     self.subtitle_combo.addItem(f"💬 {track_name}", sub_id)
-
             self.subtitle_combo.blockSignals(False)
             self.subtitle_timer.stop()
 
     def change_subtitle(self, index):
-        """Alterna a faixa de legenda do vídeo em tempo real."""
         sub_id = self.subtitle_combo.currentData()
         if sub_id is not None:
             self.media_player.video_set_spu(sub_id)
@@ -603,7 +375,7 @@ class IPTVPlayer(QMainWindow):
         self.play_channel_by_index(row)
 
     def update_video_progress(self):
-        if not self.media_player.is_playing() and not self.media_player.get_state() == vlc.State.Paused:
+        if not self.media_player.is_playing() and self.media_player.get_state() != vlc.State.Paused:
             return
 
         length = self.media_player.get_length()
@@ -611,7 +383,6 @@ class IPTVPlayer(QMainWindow):
 
         if length > 0:
             self.time_label.setText(f"{format_time(time_ms)} / {format_time(length)}")
-
             if not self.is_slider_user_dragging:
                 pos = int((time_ms / length) * 1000)
                 self.time_slider.setValue(pos)
